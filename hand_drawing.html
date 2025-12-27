@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Smart Dog - Interactive</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <style>
+        body { 
+            background: #222; 
+            color: white; 
+            display: flex; 
+            flex-direction: column; 
+            align-items: center; 
+            font-family: sans-serif; 
+            margin: 0; 
+            overflow: hidden; 
+        }
+        .container { 
+            position: relative; 
+            width: 100vw; 
+            height: 100vh; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            background: #111; 
+        }
+        canvas { 
+            position: absolute; 
+            max-width: 100%; 
+            max-height: 100%; 
+            transform: scaleX(-1); /* Mirror flip */
+        }
+        .ui-layer { 
+            position: absolute; 
+            top: 20px; 
+            left: 20px; 
+            z-index: 100; 
+            background: rgba(0,0,0,0.6); 
+            padding: 15px; 
+            border-radius: 10px; 
+            pointer-events: none; 
+            user-select: none;
+        }
+        .tips { font-size: 16px; color: #ddd; line-height: 1.8; }
+        b { color: #FFD700; }
+    </style>
+</head>
+<body>
+
+    <div class="ui-layer">
+        <div class="tips">
+            ?? <b>Pinch (Index+Thumb)</b>: Draw Green Food<br>
+            ? <b>Fist</b>: Eraser<br>
+            ?? <b>"V" Sign</b>: Summon / Send Home
+        </div>
+        <div id="status" style="color: #00FF00; margin-top:10px; font-weight:bold;">Loading AI Model...</div>
+    </div>
+
+    <div class="container">
+        <video class="input_video" style="display:none"></video>
+        <canvas class="output_canvas"></canvas>
+    </div>
+
+<script>
+    const videoElement = document.querySelector('.input_video');
+    const canvasElement = document.querySelector('.output_canvas');
+    const ctx = canvasElement.getContext('2d', { willReadFrequently: true });
+    const statusDiv = document.getElementById('status');
+
+    // Resolution
+    const W = 1280; 
+    const H = 720;
+    canvasElement.width = W; 
+    canvasElement.height = H;
+
+    // Off-screen canvas for Green Ink
+    const inkCanvas = document.createElement('canvas');
+    inkCanvas.width = W; inkCanvas.height = H;
+    const inkCtx = inkCanvas.getContext('2d', { willReadFrequently: true });
+    inkCtx.strokeStyle = '#00FF00'; 
+    inkCtx.lineWidth = 15; 
+    inkCtx.lineCap = 'round';
+
+    // Drawing State
+    let isDrawing = false; 
+    let lastX = 0, lastY = 0;
+
+    // --- Scene Constants ---
+    const HOUSE_X = W - 180; 
+    const HOUSE_Y = H - 150;
+    const HOUSE_W = 150; 
+    const HOUSE_H = 150;
+    const DOOR_X = HOUSE_X + HOUSE_W / 2;
+    const DOOR_Y = HOUSE_Y + HOUSE_H - 20;
+
+    // --- Dog State Machine ---
+    // States: SLEEPING, EXITING, WANDERING, EATING, RETURNING
+    let dog = {
+        state: 'SLEEPING', 
+        x: DOOR_X, 
+        y: DOOR_Y,
+        angle: -Math.PI/2, // Facing Up
+        speed: 6,
+        target: null,
+        lastVGestureTime: 0 // Cooldown for V gesture
+    };
+
+    // Helper: Check if finger is folded
+    function isFingerDown(lm, tipIdx, pipIdx) { return lm[tipIdx].y > lm[pipIdx].y; }
+
+    // --- Draw House & Bubble ---
+    function drawScene(ctx) {
+        // 1. Draw House
+        ctx.fillStyle = '#8D6E63'; ctx.fillRect(HOUSE_X, HOUSE_Y, HOUSE_W, HOUSE_H);
+        // Roof
+        ctx.beginPath(); 
+        ctx.moveTo(HOUSE_X-20, HOUSE_Y); 
+        ctx.lineTo(HOUSE_X+HOUSE_W+20, HOUSE_Y); 
+        ctx.lineTo(HOUSE_X+HOUSE_W/2, HOUSE_Y-80); 
+        ctx.fillStyle = '#5D4037'; ctx.fill();
+        // Door
+        ctx.fillStyle = '#3E2723'; ctx.fillRect(HOUSE_X + 40, HOUSE_Y + 60, 70, 90);
+
+        // 2. Draw Speech Bubble if Sleeping
+        if (dog.state === 'SLEEPING') {
+            ctx.save();
+            // Translate for text because canvas is mirrored
+            ctx.translate(HOUSE_X - 20, HOUSE_Y - 50);
+            ctx.scale(-1, 1); 
+            
+            // Bubble Body
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+            ctx.beginPath(); ctx.roundRect(-280, -40, 280, 60, 10); ctx.fill();
+            // Bubble Tail
+            ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(20, 20); ctx.lineTo(0, 40); ctx.fill();
+            
+            // Text
+            ctx.fillStyle = '#333'; 
+            ctx.font = "bold 18px Arial"; 
+            ctx.textAlign = "right";
+            ctx.fillText("Show 'V' sign to summon me!", -20, -5);
+            ctx.restore();
+        }
+    }
+
+    // --- Draw Animated Dog ---
+    function drawDogActor(ctx) {
+        if (dog.state === 'SLEEPING') return; // Hidden inside house
+        
+        ctx.save();
+        ctx.translate(dog.x, dog.y); 
+        ctx.rotate(dog.angle);
+
+        // Leg Animation
+        let isMoving = (dog.state === 'EATING' || dog.state === 'RETURNING' || dog.state === 'EXITING' || dog.state === 'WANDERING');
+        let swing = isMoving ? Math.sin(Date.now() / 60) * 12 : 0;
+        
+        // Legs
+        ctx.fillStyle = '#5D4037';
+        ctx.beginPath(); ctx.arc(-15 + swing, -15, 8, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(-15 - swing, 15, 8, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(-35 - swing, -15, 8, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(-35 + swing, 15, 8, 0, Math.PI*2); ctx.fill();
+        
+        // Body
+        ctx.fillStyle = '#A1887F'; 
+        ctx.beginPath(); ctx.ellipse(-10, 0, 35, 25, 0, 0, Math.PI * 2); ctx.fill();
+        
+        // Head
+        ctx.fillStyle = '#A1887F'; 
+        ctx.beginPath(); ctx.arc(20, 0, 22, 0, Math.PI*2); ctx.fill();
+        
+        // Ears
+        ctx.fillStyle = '#5D4037';
+        ctx.beginPath(); ctx.ellipse(15, -20, 8, 18, -0.3, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(15, 20, 8, 18, 0.3, 0, Math.PI*2); ctx.fill();
+        
+        // Face
+        ctx.fillStyle = 'black'; ctx.beginPath(); ctx.arc(38, 0, 5, 0, Math.PI*2); ctx.fill(); // Nose
+        ctx.fillStyle = 'white'; ctx.beginPath(); ctx.arc(25, -8, 5, 0, Math.PI*2); ctx.arc(25, 8, 5, 0, Math.PI*2); ctx.fill(); // Eyes
+        ctx.fillStyle = 'black'; ctx.beginPath(); ctx.arc(27, -8, 2, 0, Math.PI*2); ctx.arc(27, 8, 2, 0, Math.PI*2); ctx.fill(); // Pupils
+        
+        ctx.restore();
+    }
+
+    // --- AI Logic Update ---
+    function updateDogAI() {
+        const stride = 20; 
+        const imgData = inkCtx.getImageData(0, 0, W, H).data;
+        let nearestInk = null; 
+        let minInkDist = 999999;
+
+        // 1. Scan for ink (unless sleeping/returning)
+        if (dog.state !== 'SLEEPING' && dog.state !== 'RETURNING' && dog.state !== 'EXITING') {
+            for (let y = 0; y < H; y += stride) {
+                for (let x = 0; x < W; x += stride) {
+                    if (imgData[(y * W + x) * 4 + 3] > 50) { // Found green ink
+                        const dist = (x - dog.x) ** 2 + (y - dog.y) ** 2;
+                        if (dist < minInkDist) { 
+                            minInkDist = dist; 
+                            nearestInk = { x, y, dist: Math.sqrt(dist) }; 
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. State Machine Logic
+        switch (dog.state) {
+            case 'SLEEPING':
+                break;
+
+            case 'EXITING':
+                // Walk out of door slowly
+                const exitTargetY = DOOR_Y - 150;
+                const dyExit = exitTargetY - dog.y;
+                if (Math.abs(dyExit) > 5) {
+                    dog.y += (dyExit > 0 ? 1 : -1) * 2; 
+                    dog.angle = -Math.PI / 2; 
+                } else {
+                    dog.state = 'WANDERING'; 
+                }
+                break;
+
+            case 'EATING':
+            case 'WANDERING':
+                if (nearestInk) {
+                    // FOOD FOUND!
+                    dog.state = 'EATING';
+                    dog.target = nearestInk;
+                    if (nearestInk.dist > 25) {
+                        moveDogTowards(dog.target.x, dog.target.y, dog.speed);
+                    } else {
+                        // Munch munch (Erase ink)
+                        inkCtx.save(); 
+                        inkCtx.globalCompositeOperation = 'destination-out';
+                        inkCtx.beginPath(); 
+                        inkCtx.arc(nearestInk.x, nearestInk.y, 50, 0, Math.PI*2); 
+                        inkCtx.fill(); 
+                        inkCtx.restore();
+                    }
+                } else {
+                    // NO FOOD, JUST CHILLING
+                    dog.state = 'WANDERING';
+                    if (!dog.target || Math.hypot(dog.target.x - dog.x, dog.target.y - dog.y) < 50) {
+                        // Pick random spot on left side of screen
+                        dog.target = { x: Math.random() * (W - 300) + 100, y: Math.random() * (H - 200) + 100 };
+                    }
+                    moveDogTowards(dog.target.x, dog.target.y, dog.speed * 0.5); 
+                }
+                break;
+
+            case 'RETURNING':
+                // Go back to door
+                const distToDoor = Math.hypot(DOOR_X - dog.x, DOOR_Y - dog.y);
+                if (distToDoor > 10) {
+                    moveDogTowards(DOOR_X, DOOR_Y, dog.speed);
+                } else {
+                    dog.state = 'SLEEPING'; 
+                    dog.x = DOOR_X; 
+                    dog.y = DOOR_Y; 
+                }
+                break;
+        }
+    }
+
+    // Helper: Move dog
+    function moveDogTowards(tx, ty, speed) {
+        const dx = tx - dog.x; 
+        const dy = ty - dog.y;
+        dog.angle = Math.atan2(dy, dx);
+        dog.x += Math.cos(dog.angle) * speed;
+        dog.y += Math.sin(dog.angle) * speed;
+    }
+
+    function onResults(results) {
+        statusDiv.innerText = "AI Ready. Try gestures!";
+        ctx.clearRect(0, 0, W, H);
+        
+        // Layer 1: Video
+        ctx.drawImage(results.image, 0, 0, W, H);
+        // Layer 2: House & Bubble
+        drawScene(ctx);
+        // Layer 3: Ink
+        ctx.drawImage(inkCanvas, 0, 0);
+
+        // Update & Draw Dog
+        updateDogAI();
+        drawDogActor(ctx);
+
+        // Layer 4: Hand Gestures
+        if (results.multiHandLandmarks.length > 0) {
+            const lm = results.multiHandLandmarks[0];
+            
+            // Draw Hand Skeleton
+            drawConnectors(ctx, lm, HAND_CONNECTIONS, {color: 'rgba(0,255,255,0.5)', lineWidth: 2});
+            drawLandmarks(ctx, lm, {color: 'rgba(255,0,0,0.5)', lineWidth: 1, radius: 3});
+
+            const x8 = lm[8].x * W, y8 = lm[8].y * H; // Index Tip
+            const x4 = lm[4].x * W, y4 = lm[4].y * H; // Thumb Tip
+            
+            // --- Logic 1: V Gesture (Summon/Home) ---
+            // Index & Middle UP, Ring & Pinky DOWN
+            const isV = (!isFingerDown(lm,8,6) && !isFingerDown(lm,12,10) && isFingerDown(lm,16,14) && isFingerDown(lm,20,18));
+            
+            if (isV) {
+                const now = Date.now();
+                if (now - dog.lastVGestureTime > 1500) { // 1.5s Cooldown
+                    if (dog.state === 'SLEEPING') {
+                        dog.state = 'EXITING'; // Come out
+                    } else if (dog.state === 'WANDERING' || dog.state === 'EATING') {
+                        dog.state = 'RETURNING'; // Go home
+                        dog.target = null;
+                    }
+                    dog.lastVGestureTime = now;
+                }
+            }
+
+            // --- Logic 2: Pinch to Draw ---
+            if (Math.hypot(x8 - x4, y8 - y4) < 50) {
+                const drawX = (x8 + x4) / 2; 
+                const drawY = (y8 + y4) / 2;
+                inkCtx.globalCompositeOperation = 'source-over';
+                inkCtx.beginPath();
+                if (isDrawing) { 
+                    inkCtx.moveTo(lastX, lastY); 
+                    inkCtx.lineTo(drawX, drawY); 
+                    inkCtx.stroke(); 
+                }
+                isDrawing = true; 
+                lastX = drawX; 
+                lastY = drawY;
+            } else { 
+                isDrawing = false; 
+            }
+
+            // --- Logic 3: Fist to Erase ---
+            // Fingers folded
+            if (isFingerDown(lm,12,9) && isFingerDown(lm,16,13) && isFingerDown(lm,20,17)) {
+                const eraseX = lm[9].x * W; 
+                const eraseY = lm[9].y * H;
+                
+                // Erase ink
+                inkCtx.save(); 
+                inkCtx.globalCompositeOperation = 'destination-out';
+                inkCtx.beginPath(); 
+                inkCtx.arc(eraseX, eraseY, 50, 0, Math.PI*2); 
+                inkCtx.fill(); 
+                inkCtx.restore();
+                
+                // Visual eraser
+                ctx.beginPath(); 
+                ctx.arc(eraseX, eraseY, 50, 0, Math.PI*2); 
+                ctx.fillStyle = 'rgba(255,255,255,0.3)'; 
+                ctx.fill();
+            }
+        }
+    }
+
+    const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, { onFrame: async () => { await hands.send({image: videoElement}); }, width: W, height: H });
+    camera.start();
+</script>
+</body>
+</html>
